@@ -16,6 +16,9 @@ typedef struct {
 
 	socklen_t	socklen;
 
+	time_t		checked;
+	ngx_uint_t	fails;
+
 	ngx_str_t	name;
 	u_char		ipstr[NGX_SOCKADDR_STRLEN + 1];
 
@@ -26,6 +29,7 @@ typedef struct {
 
 typedef struct ngx_upstream_jdomain_srv_conf {
 	ngx_upstream_jdomain_peer_t		*peers;
+	ngx_upstream_jdomain_peer_t		*temp_peers;
 	ngx_uint_t		default_port;
 
 	ngx_uint_t		resolved_max_ips;
@@ -35,6 +39,9 @@ typedef struct ngx_upstream_jdomain_srv_conf {
 	ngx_uint_t		resolved_index;
 	time_t 			resolved_access;
 	time_t			resolved_interval;
+
+	time_t			fail_timeout;
+	ngx_uint_t		max_fails;
 
 	ngx_uint_t		upstream_retry;
 	ngx_str_t		upstream_backup_file;

@@ -423,7 +423,9 @@ ngx_upstream_jdomain_get_peer(ngx_peer_connection_t *pc, void *data)
 {
 	ngx_upstream_jdomain_peer_data_t	*urpd = data;
 	ngx_upstream_jdomain_srv_conf_t	*urcf = urpd->conf;
-	ngx_upstream_jdomain_peer_t		*peer;
+	ngx_upstream_jdomain_peer_t		*peer = NULL;
+	time_t now = ngx_time();
+	ngx_uint_t i;
 
 	pc->cached = 0;
 	pc->connection = NULL;
@@ -445,19 +447,41 @@ ngx_upstream_jdomain_get_peer(ngx_peer_connection_t *pc, void *data)
 	ngx_log_debug1(NGX_LOG_DEBUG_HTTP, pc->log, 0,
 		"upstream_jdomain: resolved_num=%ud", urcf->resolved_num); 
 
-	if(urpd->current == -1){
-		urcf->resolved_index = (urcf->resolved_index + 1) % urcf->resolved_num;
+	for (i = 0; i < urcf->resolved_num; i++) {
+		ngx_upstream_jdomain_peer_t *ipeer;
 
-		urpd->current = urcf->resolved_index;
-	}else{
-		urpd->current = (urpd->current + 1) % urcf->resolved_num;
+		if(urpd->current == -1){
+			urcf->resolved_index = (urcf->resolved_index + 1) % urcf->resolved_num;
+
+			urpd->current = urcf->resolved_index;
+		}else{
+			urpd->current = (urpd->current + 1) % urcf->resolved_num;
+		}
+		ipeer = &(urcf->peers[urpd->current]);
+		if (urcf->max_fails
+			&& ipeer->fails >= urcf->max_fails
+			&& now - ipeer->checked <= urcf->fail_timeout) {
+
+			continue;
+		}
+		peer = ipeer;
+		break;
 	}
 
-	peer = &(urcf->peers[urpd->current]);
+	if (peer == NULL) {
+		ngx_log_error(NGX_LOG_ERR, pc->log, 0,
+			"upstream_jdomain: no active peers for \"%V\"", &urcf->resolved_domain);
+		/* we don't return NGX_BUSY here to not allow nginx to try other servers in the upstream */
+		return NGX_ERROR;
+	}
 
 	pc->sockaddr = &peer->sockaddr;
 	pc->socklen = peer->socklen;
 	pc->name = &peer->name;
+
+	if (now - peer->checked > urcf->fail_timeout) {
+		peer->checked = now;
+	}
 
 	ngx_log_debug2(NGX_LOG_DEBUG_HTTP, pc->log, 0,
 		"upstream_jdomain: upstream to DNS peer (%s:%ud)",
@@ -470,6 +494,24 @@ ngx_upstream_jdomain_get_peer(ngx_peer_connection_t *pc, void *data)
 static void
 ngx_upstream_jdomain_free_peer(ngx_peer_connection_t *pc, void *data,ngx_uint_t state)
 {
+	ngx_upstream_jdomain_peer_data_t	*urpd = data;
+	ngx_upstream_jdomain_srv_conf_t	*urcf = urpd->conf;
+	ngx_upstream_jdomain_peer_t		*peer = &(urcf->peers[urpd->current]);
+
+	if (state & NGX_PEER_FAILED) {
+		if (urcf->max_fails) {
+			time_t now = ngx_time();
+
+			peer->fails++;
+			peer->checked = now;
+			if (peer->fails >= urcf->max_fails) {
+				ngx_log_error(NGX_LOG_WARN, pc->log, 0,
+								"upstream jdomain peer temporarily disabled");
+			}
+		}
+	} else {
+		peer->fails = 0;
+	}
 	if(pc->tries > 0)
 		pc->tries--;
 }
@@ -477,9 +519,9 @@ ngx_upstream_jdomain_free_peer(ngx_peer_connection_t *pc, void *data,ngx_uint_t 
 char *
 ngx_upstream_jdomain(ngx_conf_t *cf, ngx_command_t *cmd, ngx_upstream_jdomain_srv_conf_t *urcf)
 {
-	time_t			interval;
+	time_t			interval, fail_timeout;
 	ngx_str_t		*value, domain, s, backup_file, temp_backup_dir;
-	ngx_int_t		default_port, max_ips;
+	ngx_int_t		default_port, max_ips, max_fails;
 	ngx_uint_t		retry, fail;
 	ngx_upstream_jdomain_peer_t		*paddr;
 	ngx_url_t		u;
@@ -489,6 +531,8 @@ ngx_upstream_jdomain(ngx_conf_t *cf, ngx_command_t *cmd, ngx_upstream_jdomain_sr
 	interval = 1;
 	default_port = 80;
 	max_ips = 20;
+	max_fails = 0;
+	fail_timeout = 10;
 	retry = 1;
 	fail = 1;
 	domain.data = NULL;
@@ -568,6 +612,34 @@ ngx_upstream_jdomain(ngx_conf_t *cf, ngx_command_t *cmd, ngx_upstream_jdomain_sr
 			continue;
 		}
 
+		if (ngx_strncmp(value[i].data, "max_fails=", 10) == 0) {
+			max_fails = ngx_atoi(value[i].data + 10, value[i].len - 10);
+
+			if (max_fails < 0) {
+				goto invalid;
+			}
+#if (nginx_version) < 1005008
+			/* we do not support nonzero max_fails feature for old nginx versions */
+			if (max_fails) {
+				goto invalid;
+			}
+#endif
+
+			continue;
+		}
+
+		if (ngx_strncmp(value[i].data, "fail_timeout=", 13) == 0) {
+			s.len = value[i].len - 13;
+			s.data = &value[i].data[13];
+
+			fail_timeout = ngx_parse_time(&s, 1);
+
+			if (fail_timeout == (time_t) NGX_ERROR) {
+				goto invalid;
+			}
+
+			continue;
+		}
 
 		goto invalid;
 
@@ -578,8 +650,10 @@ ngx_upstream_jdomain(ngx_conf_t *cf, ngx_command_t *cmd, ngx_upstream_jdomain_sr
 
 	urcf->peers = ngx_pcalloc(cf->pool,
 			max_ips * sizeof(ngx_upstream_jdomain_peer_t));
+	urcf->temp_peers = ngx_pcalloc(cf->pool,
+			max_ips * sizeof(ngx_upstream_jdomain_peer_t));
 
-	if (urcf->peers == NULL) {
+	if (urcf->peers == NULL || urcf->temp_peers == NULL) {
 		ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
 			"ngx_palloc peers fail");
 
@@ -595,6 +669,8 @@ ngx_upstream_jdomain(ngx_conf_t *cf, ngx_command_t *cmd, ngx_upstream_jdomain_sr
 	urcf->resolved_domain = domain;
 	urcf->default_port = default_port;
 	urcf->resolved_max_ips = max_ips;
+	urcf->max_fails = max_fails;
+	urcf->fail_timeout = fail_timeout;
 	urcf->upstream_retry = retry;
 	urcf->upstream_backup_file = backup_file;
 	urcf->upstream_temp_backup_dir = temp_backup_dir;
@@ -716,6 +792,10 @@ ngx_upstream_jdomain_handler(ngx_resolver_ctx_t *ctx)
 	ngx_resolver_t		*r;
 	ngx_upstream_jdomain_peer_t		*peer;
 	ngx_upstream_jdomain_srv_conf_t	*urcf = ctx->data;
+#if (nginx_version) >= 1005008
+	ngx_uint_t		j, temp_peers_from;
+	ngx_uint_t		resolved_num_orig = urcf->resolved_num;
+#endif
 	time_t next_resolve;
 
 	r = ctx->resolver;
@@ -734,23 +814,38 @@ ngx_upstream_jdomain_handler(ngx_resolver_ctx_t *ctx)
 		goto end;
 	}
 
+#if (nginx_version) >= 1005008
+	if (urcf->max_fails) {
+		ngx_memcpy(urcf->temp_peers, urcf->peers, resolved_num_orig * sizeof(ngx_upstream_jdomain_peer_t));
+		temp_peers_from = 0;
+	} else {
+		/* max_fails feature is not enabled, skip searching in urcf->temp_peers */
+		temp_peers_from = resolved_num_orig;
+	}
+#endif
 	urcf->resolved_num = 0;
 
 	for (i = 0; i < ctx->naddrs; i++) {
+		socklen_t socklen;
+
+#if (nginx_version) < 1005008
+		socklen = sizeof(struct sockaddr);
+#else
+		socklen = ctx->addrs[i].socklen;
+#endif
 
 		peer = &urcf->peers[urcf->resolved_num];
 		addr = &peer->sockaddr;
 
+		peer->fails = 0;
+		peer->checked = 0;
+		peer->socklen = socklen;
 #if (nginx_version) < 1005008
-		peer->socklen = sizeof(struct sockaddr);
-
 		((struct sockaddr_in*)addr)->sin_family = AF_INET;
 		((struct sockaddr_in*)addr)->sin_addr.s_addr = ctx->addrs[i];
 		((struct sockaddr_in*)addr)->sin_port = htons(urcf->default_port);
 #else
-		peer->socklen = ctx->addrs[i].socklen;
-
-		ngx_memcpy(addr, ctx->addrs[i].sockaddr, peer->socklen);
+		ngx_memcpy(addr, ctx->addrs[i].sockaddr, socklen);
 
 		switch (addr->sa_family) {
 		case AF_INET6:
@@ -760,6 +855,24 @@ ngx_upstream_jdomain_handler(ngx_resolver_ctx_t *ctx)
 			((struct sockaddr_in*)addr)->sin_port = htons((u_short) urcf->default_port);
 		}
 
+		for (j = temp_peers_from; j < resolved_num_orig; j++) {
+			ngx_upstream_jdomain_peer_t *temp_peer = &urcf->temp_peers[j];
+			struct sockaddr *temp_addr = &temp_peer->sockaddr;
+			if (temp_peer->socklen == socklen && !ngx_memcmp(temp_addr, addr, socklen)) {
+				/* partially copy data for the peer from the previous peer instance */
+				peer->fails = temp_peer->fails;
+				peer->checked = temp_peer->checked;
+
+				if (j != temp_peers_from) {
+					/* swap two peers in urcf->temp_peers to skip found peers on the next records of ctx->addrs */
+					ngx_upstream_jdomain_peer_t temp_peer_copy = *temp_peer;
+					*temp_peer = urcf->temp_peers[temp_peers_from];
+					urcf->temp_peers[temp_peers_from] = temp_peer_copy;
+				}
+				temp_peers_from++;
+				break;
+			}
+		}
 #endif
 		peer->name.data = peer->ipstr;
 		peer->name.len = 
